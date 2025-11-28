@@ -67,7 +67,7 @@ This project solves a complex geospatial reverse-engineering problem by:
 Clone the repository:
 
 ```bash
-git clone https://github.com/yourusername/riyadh-urban-scraper.git
+git clone https://github.com/shivamvats1204/riyadh-urban-scraper.git
 cd riyadh-urban-scraper
 ```
 
@@ -176,7 +176,7 @@ This ensures **no regulatory info is lost**.
 ## ⚠️ **Disclaimer**
 
 This project is for **educational and research purposes only**.
-All extracted data belongs to their respective owners.
+All extracted data belongs to its respective owners.
 Please respect the **Terms of Service**, **robots.txt**, and legal restrictions of any API or website you access.
 The author is not responsible for misuse.
 
