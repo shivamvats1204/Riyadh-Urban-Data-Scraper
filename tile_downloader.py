@@ -1,146 +1,173 @@
-import pandas as pd
 import requests
+import mapbox_vector_tile
+from shapely.geometry import shape
+import csv
+import math
+import pandas as pd
 import concurrent.futures
 from tqdm import tqdm
-import time
-import os
-import json
 
 # -------------------------------
 # CONFIGURATION
 # -------------------------------
-# Double check this filename matches your actual file on disk
-INPUT_CSV = "riyadh_parcels_centroids.csv"
-OUTPUT_CSV = "riyadh_parcels_full_data_final.csv"
-API_URL = "https://api2.suhail.ai/parcel/buildingRules?parcelObjectId={}"
+ZOOM = 15
+EXTENT = 4096 # Standard MVT extent
+CSV_FILE = "/content/drive/MyDrive/suhail/riyadh_parcels_centroids.csv"
+BASE_URL = "https://tiles.suhail.ai/maps/riyadh/{z}/{x}/{y}.vector.pbf"
 
-# WORKER SETTINGS
-# 15 is a safe speed. If you get many "RATE_LIMIT" errors, lower to 10.
-MAX_WORKERS = 50
-SAVE_EVERY = 1000  # Write to disk every 1000 rows
+# Bounding box (Defined as North, West, South, East)
+# Note: LAT1 is North, LAT2 is South.
+NORTH, WEST = 25.05353592113, 46.39363649381  # Upper-left (North, West)
+SOUTH, EAST = 24.44301255252, 47.05126713773  # Lower-right (South, East)
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-    "Referer": "https://suhail.ai/"
-}
-
+MAX_WORKERS = 8
 # -------------------------------
-# 1. READ INPUT DATA
-# -------------------------------
-print("Reading input CSV (this may take a moment)...")
-if not os.path.exists(INPUT_CSV):
-    print(f"Error: Input file '{INPUT_CSV}' not found.")
-    exit()
 
-# Force IDs to strings to prevent scientific notation (E+11) issues
-df_input = pd.read_csv(INPUT_CSV, dtype={'parcel_objectid': str, 'parcel_id': str})
+def lonlat_to_tile(lon, lat, z):
+    """Converts WGS84 (lon, lat) to Z/X/Y tile coordinates."""
+    # Standard Web Mercator (Slippy Map) tile calculation
+    n = 2 ** z
+    x_tile = int((lon + 180.0) / 360.0 * n)
+    lat_rad = math.radians(lat)
+    y_tile = int((1 - math.log(math.tan(lat_rad) + 1 / math.cos(lat_rad)) / math.pi) / 2 * n)
+    return x_tile, y_tile
 
-# Remove rows with missing IDs
-parcels = df_input.dropna(subset=['parcel_objectid']).to_dict('records')
-print(f"Loaded {len(parcels)} parcels to process.")
+def tile_coords_to_lonlat(px, py, z, tile_x, tile_y, extent=EXTENT):
+    """
+    Converts tile-local pixel coordinates (px, py) back to WGS84 (lon, lat).
 
-# -------------------------------
-# 2. FETCH FUNCTION
-# -------------------------------
-def fetch_parcel_data(row):
-    # Prepare ID: clean string, remove decimals
-    pid = str(row.get('parcel_objectid', '')).strip()
-    if pid.endswith('.0'):
-        pid = pid[:-2]
+    Fix: Mapbox Vector Tiles use a Y-down coordinate system (top-left origin).
+    The tile coordinates must be flipped before transformation to lat/lon.
 
-    url = API_URL.format(pid)
+    px, py are 0 to EXTENT-1.
+    """
+    # 1. Normalize tile-local pixel to 0-1 range (0-1 for fx, fy)
+    fx = px / extent
 
-    # Initialize fields with None so columns align in CSV
-    new_cols = {
-        'landuse': None, 'zoningGroup': None, 'description': None,
-        'coloringDescription': None, 'maxBuildingHeight': None,
-        'maxParcelCoverage': None, 'maxBuildingCoefficient': None,
-        'mainStreetsSetback': None, 'sideRearSetback': None,
-        'zoningId': None, 'api_status': "FAILED"
-    }
-    row.update(new_cols)
+    # 2. **CRITICAL FIX**: Flip the Y-coordinate (py).
+    # MVT coordinates are Y-down (origin at top-left).
+    # Web Mercator math expects a Y-up coordinate system (origin at bottom-left) OR
+    # the coordinate must be adjusted from the top-left origin.
+    fy = (extent - py) / extent # Flips Y and normalizes
+
+    # 3. Apply the standard mercator inverse projection using the normalized coordinates
+    n = 2 ** z
+
+    # Compute the fractional tile part for both X and Y
+    x_frac = tile_x + fx
+    y_frac = tile_y + fy
+
+    lon = (x_frac / n) * 360.0 - 180.0
+
+    # Inverse Mercator projection formula
+    lat_rad = math.atan(math.sinh(math.pi * (1 - 2 * y_frac / n)))
+    lat = math.degrees(lat_rad)
+
+    return lon, lat
+
+def process_tile(tile_info):
+    x, y = tile_info
+    centroids = []
+    tile_url = BASE_URL.format(z=ZOOM, x=x, y=y)
 
     try:
-        response = requests.get(url, headers=HEADERS, timeout=10)
+        response = requests.get(tile_url, timeout=10)
+        if response.status_code != 200:
+            # We silently skip 404 (empty desert tiles)
+            # print(f"Failed tile {x},{y}: {response.status_code}")
+            return centroids
 
-        if response.status_code == 200:
-            json_data = response.json()
-            data_list = json_data.get('data', [])
+        tile = mapbox_vector_tile.decode(response.content)
 
-            if data_list and isinstance(data_list, list) and len(data_list) > 0:
-                info = data_list[0]
+        # FIX: The layer name is often not 'parcels', but the first key in the decoded tile.
+        if tile:
+            # Get the name of the first (and usually only) layer
+            layer_name = next(iter(tile))
+            layer = tile[layer_name]
 
-                # Update row with extracted fields
-                row['landuse'] = info.get('landuse')
-                row['zoningGroup'] = info.get('zoningGroup')
-                row['description'] = info.get('description')
-                row['coloringDescription'] = info.get('coloringDescription')
-                row['maxBuildingHeight'] = info.get('maxBuildingHeight')
-                row['maxParcelCoverage'] = info.get('maxParcelCoverage')
-                row['maxBuildingCoefficient'] = info.get('maxBuildingCoefficient')
-                row['mainStreetsSetback'] = info.get('mainStreetsSetback')
-                row['sideRearSetback'] = info.get('sideRearSetback')
-                row['zoningId'] = info.get('zoningId')
-                row['api_status'] = "SUCCESS"
-            else:
-                row['api_status'] = "NO_DATA_IN_LIST"
+            for feature in layer.get("features", []):
+                props = feature.get("properties", {})
 
-        elif response.status_code == 429:
-            row['api_status'] = "RATE_LIMIT"
-            time.sleep(2) # Auto-throttle
-        elif response.status_code == 404:
-             row['api_status'] = "NOT_FOUND"
-        else:
-            row['api_status'] = f"HTTP_{response.status_code}"
+                # Use a common pattern to find the ID
+                parcel_id = props.get("parcel_id") or props.get("id")
+                parcel_objectid = props.get("parcel_objectid") or props.get("OBJECTID")
 
+                geom = feature.get("geometry")
+
+                if parcel_id and parcel_objectid and geom:
+                    try:
+                        # Shapely converts the raw MVT geometry data (in EXTENT units)
+                        poly = shape(geom)
+
+                        # Find the centroid in MVT coordinates (0 to EXTENT-1)
+                        centroid = poly.centroid
+
+                        # Convert the tile-local centroid to WGS84 lon/lat
+                        lon, lat = tile_coords_to_lonlat(
+                            centroid.x, centroid.y, ZOOM, x, y, EXTENT
+                        )
+
+                        centroids.append({
+                            "parcel_id": parcel_id,
+                            "parcel_objectid": parcel_objectid,
+                            "lon": lon,
+                            "lat": lat
+                        })
+                    except Exception as e:
+                        # Log error for a specific parcel
+                        print(f"Failed processing parcel in tile {x},{y}: {e}")
+
+    except requests.exceptions.Timeout:
+        # Log error for tile download
+        print(f"Timeout downloading tile {x},{y}")
     except Exception as e:
-        row['api_status'] = "ERROR_CONNECTION"
+        # Log error for general issues (e.g., bad connection, corrupt tile)
+        print(f"Error downloading/decoding tile {x},{y}: {e}")
 
-    return row
+    return centroids
 
 # -------------------------------
-# 3. MAIN EXECUTION (CHUNKED SAVING)
+# EXECUTION
 # -------------------------------
-print(f"Starting FULL extraction with {MAX_WORKERS} workers...")
-print(f"Progress will be saved to '{OUTPUT_CSV}' every {SAVE_EVERY} rows.")
 
-results_buffer = []
-file_initialized = False # Tracks if we have written the header yet
+# Compute tile ranges based on the corrected coordinates: (min/max LON, min/max LAT)
+x_min, y_min = lonlat_to_tile(WEST, NORTH, ZOOM)
+x_max, y_max = lonlat_to_tile(EAST, SOUTH, ZOOM)
 
-# Check if output file already exists (to avoid overwriting if you restart)
-if os.path.exists(OUTPUT_CSV):
-    print("⚠️ Warning: Output file already exists. New data will be appended.")
-    # If resuming, you might want to load existing IDs and skip them,
-    # but for simplicity, this script just appends.
-    file_initialized = True
+# Generate the full grid of tiles to scan
+# Ensure the range accounts for the possibility that the y_min > y_max
+x_start = min(x_min, x_max)
+x_end = max(x_min, x_max)
+y_start = min(y_min, y_max)
+y_end = max(y_min, y_max)
 
+tiles = [(x, y) for x in range(x_start, x_end + 1)
+                for y in range(y_start, y_end + 1)]
+
+print(f"Calculated X range: {x_start} to {x_end}")
+print(f"Calculated Y range: {y_start} to {y_end}")
+print(f"Total tiles to process: {len(tiles)}")
+
+all_centroids = []
+
+# Use ThreadPoolExecutor with progress bar
 with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-    futures = executor.map(fetch_parcel_data, parcels)
+    # Use list() to force evaluation and collect results from the map generator
+    results = list(tqdm(executor.map(process_tile, tiles), total=len(tiles), desc="Processing tiles"))
 
-    for i, result in tqdm(enumerate(futures), total=len(parcels), desc="Processing"):
-        results_buffer.append(result)
+# Collect all data
+for r in results:
+    all_centroids.extend(r)
 
-        # SAVE BUFFER TO DISK
-        if len(results_buffer) >= SAVE_EVERY:
-            df_chunk = pd.DataFrame(results_buffer)
+# Filter for uniqueness before saving (essential when scanning tiles due to overlap)
+df = pd.DataFrame(all_centroids).drop_duplicates(subset=['parcel_id'])
+final_count = len(df)
 
-            # mode='a' means append
-            # header=not file_initialized means write header only once at the top
-            if not file_initialized:
-                df_chunk.to_csv(OUTPUT_CSV, index=False, mode='w', encoding='utf-8-sig')
-                file_initialized = True
-            else:
-                df_chunk.to_csv(OUTPUT_CSV, index=False, mode='a', header=False, encoding='utf-8-sig')
+# Save CSV
+with open(CSV_FILE, "w", newline="", encoding="utf-8") as f:
+    fieldnames = ["parcel_id", "parcel_objectid", "lon", "lat"]
+    writer = csv.DictWriter(f, fieldnames=fieldnames)
+    writer.writeheader()
+    writer.writerows(df.to_dict('records'))
 
-            # Clear memory
-            results_buffer = []
-
-# SAVE REMAINING ROWS (After loop finishes)
-if results_buffer:
-    df_chunk = pd.DataFrame(results_buffer)
-    if not file_initialized:
-        df_chunk.to_csv(OUTPUT_CSV, index=False, mode='w', encoding='utf-8-sig')
-    else:
-        df_chunk.to_csv(OUTPUT_CSV, index=False, mode='a', header=False, encoding='utf-8-sig')
-
-print(f"\n✅ COMPLETE! All data saved to: {OUTPUT_CSV}")
+print(f"\nSaved {final_count} unique parcel centroids to {CSV_FILE}")

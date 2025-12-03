@@ -1,165 +1,213 @@
 import pandas as pd
-import requests
-import concurrent.futures
-from tqdm import tqdm
-import time
+import asyncio
+import aiohttp
 import os
 import json
+import time
+from tqdm.asyncio import tqdm
 
 # -------------------------------
 # CONFIGURATION
 # -------------------------------
-INPUT_CSV = "riyadh_parcels_centroids.csv"         # The source of IDs
-OUTPUT_CSV = "riyadh_parcels_full_data_final.csv"     # The file you are saving to
+INPUT_CSV = "/content/drive/MyDrive/suhail/riyadh_parcels_centroids_corrected_15 (1).csv"
+OUTPUT_CSV = "/content/drive/MyDrive/suhail/riyadh_parcels_full_data_final2.csv"
 API_URL = "https://api2.suhail.ai/parcel/buildingRules?parcelObjectId={}"
 
-MAX_WORKERS = 15
+# ASYNC SETTINGS
+# '40' in Async is much more powerful than '40' in Threads.
+# It keeps the pipe full 100% of the time.
+CONCURRENT_LIMIT = 40
 SAVE_EVERY = 1000
+MAX_RETRIES = 5
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-    "Referer": "https://suhail.ai/"
+    "Referer": "https://suhail.ai/",
+    "Connection": "keep-alive"
 }
 
-# -------------------------------
-# 1. SMART RESUME LOGIC
-# -------------------------------
-print("--- RESUMING JOB ---")
+# STRICT COLUMNS
+FINAL_COLUMNS = [
+    'parcel_id', 'parcel_objectid', 'lon', 'lat', 'rule_id',
+    'zoningId', 'zoningColor', 'zoningGroup', 'landuse', 'description',
+    'name', 'coloring', 'coloringDescription', 'maxBuildingCoefficient',
+    'maxBuildingHeight', 'maxParcelCoverage', 'maxRuleDepth',
+    'mainStreetsSetback', 'secondaryStreetsSetback', 'sideRearSetback',
+    'api_status', 'extra_data'
+]
+KNOWN_COLUMNS_SET = set(FINAL_COLUMNS)
 
-# A. Read the Source Input
-print("Reading Input CSV...")
+# -------------------------------
+# 1. SETUP
+# -------------------------------
+print("--- STARTING ULTRA-FAST ASYNC SCRAPER ---")
+
 if not os.path.exists(INPUT_CSV):
     print(f"Error: Input file '{INPUT_CSV}' not found.")
     exit()
 
 df_input = pd.read_csv(INPUT_CSV, dtype={'parcel_objectid': str, 'parcel_id': str})
 df_input = df_input.dropna(subset=['parcel_objectid'])
-total_parcels = len(df_input)
-print(f"Total Source Parcels: {total_parcels}")
 
-# B. Read the Existing Output (to see what's done)
 processed_ids = set()
+write_header = True
 
 if os.path.exists(OUTPUT_CSV):
-    print(f"Reading existing Output CSV to find completed rows...")
     try:
-        # Read only the 'parcel_objectid' column to save memory
         df_done = pd.read_csv(OUTPUT_CSV, usecols=['parcel_objectid'], dtype={'parcel_objectid': str})
         processed_ids = set(df_done['parcel_objectid'].tolist())
-        print(f"✅ Found {len(processed_ids)} parcels already completed.")
-    except ValueError:
-        print("⚠️ Warning: Output CSV exists but might be empty or missing 'parcel_objectid' column.")
-        print("Starting from zero for safety (or check your file).")
-else:
-    print("No existing output file found. Starting from scratch.")
+        write_header = False
+        print(f"✅ Found {len(processed_ids)} processed parcels. Skipping.")
+    except Exception:
+        if os.path.exists(OUTPUT_CSV) and os.path.getsize(OUTPUT_CSV) > 0:
+             write_header = False
 
-# C. Filter: Keep only what is NOT done
-# We use a lambda to check if the ID is NOT in the processed_ids set
 parcels_to_do = df_input[~df_input['parcel_objectid'].isin(processed_ids)].to_dict('records')
+print(f"Remaining Parcels: {len(parcels_to_do)}")
 
-remaining_count = len(parcels_to_do)
-print(f"------------------------------------------------")
-print(f"Skipping: {len(processed_ids)}")
-print(f"REMAINING: {remaining_count}")
-print(f"------------------------------------------------")
-
-if remaining_count == 0:
-    print("🎉 Job is already 100% complete! Nothing to do.")
+if len(parcels_to_do) == 0:
+    print("🎉 Job is already complete!")
     exit()
 
 # -------------------------------
-# 2. FETCH FUNCTION
+# 2. ASYNC WORKER
 # -------------------------------
-def fetch_parcel_data(row):
-    pid = str(row.get('parcel_objectid', '')).strip()
-    if pid.endswith('.0'):
-        pid = pid[:-2]
+async def fetch_parcel(session, row, semaphore):
+    # The semaphore limits how many functions run at once
+    async with semaphore:
+        pid = str(row.get('parcel_objectid', '')).strip()
+        if pid.endswith('.0'):
+            pid = pid[:-2]
 
-    url = API_URL.format(pid)
+        url = API_URL.format(pid)
+        base_row = {k: row.get(k) for k in row if k in KNOWN_COLUMNS_SET}
+        generated_rows = []
 
-    # Initialize fields
-    new_cols = {
-        'landuse': None, 'zoningGroup': None, 'description': None,
-        'coloringDescription': None, 'maxBuildingHeight': None,
-        'maxParcelCoverage': None, 'maxBuildingCoefficient': None,
-        'mainStreetsSetback': None, 'sideRearSetback': None,
-        'zoningId': None, 'api_status': "FAILED"
-    }
-    row.update(new_cols)
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                async with session.get(url, timeout=20) as response:
 
-    try:
-        response = requests.get(url, headers=HEADERS, timeout=10)
+                    if response.status == 200:
+                        try:
+                            json_data = await response.json()
+                        except:
+                            # Handle cases where JSON is malformed
+                            base_row['api_status'] = "JSON_ERROR"
+                            generated_rows.append(base_row)
+                            return generated_rows
 
-        if response.status_code == 200:
-            json_data = response.json()
-            data_list = json_data.get('data', [])
+                        data_list = json_data.get('data', [])
 
-            if data_list and isinstance(data_list, list) and len(data_list) > 0:
-                info = data_list[0]
-                row['landuse'] = info.get('landuse')
-                row['zoningGroup'] = info.get('zoningGroup')
-                row['description'] = info.get('description')
-                row['coloringDescription'] = info.get('coloringDescription')
-                row['maxBuildingHeight'] = info.get('maxBuildingHeight')
-                row['maxParcelCoverage'] = info.get('maxParcelCoverage')
-                row['maxBuildingCoefficient'] = info.get('maxBuildingCoefficient')
-                row['mainStreetsSetback'] = info.get('mainStreetsSetback')
-                row['sideRearSetback'] = info.get('sideRearSetback')
-                row['zoningId'] = info.get('zoningId')
-                row['api_status'] = "SUCCESS"
-            else:
-                row['api_status'] = "NO_DATA_IN_LIST"
+                        if data_list and isinstance(data_list, list) and len(data_list) > 0:
+                            for info in data_list:
+                                new_row = base_row.copy()
+                                extra_data_bucket = {}
 
-        elif response.status_code == 429:
-            row['api_status'] = "RATE_LIMIT"
-            time.sleep(2)
-        elif response.status_code == 404:
-             row['api_status'] = "NOT_FOUND"
-        else:
-            row['api_status'] = f"HTTP_{response.status_code}"
+                                for key, value in info.items():
+                                    target_key = 'rule_id' if key == 'id' else key
+                                    if target_key in KNOWN_COLUMNS_SET:
+                                        new_row[target_key] = value
+                                    else:
+                                        extra_data_bucket[key] = value
 
-    except Exception as e:
-        row['api_status'] = "ERROR_CONNECTION"
+                                if extra_data_bucket:
+                                    new_row['extra_data'] = json.dumps(extra_data_bucket, ensure_ascii=False)
 
-    return row
+                                new_row['api_status'] = "SUCCESS"
+                                generated_rows.append(new_row)
+                            return generated_rows
+                        else:
+                            base_row['api_status'] = "NO_DATA_IN_LIST"
+                            generated_rows.append(base_row)
+                            return generated_rows
+
+                    elif response.status == 404:
+                        base_row['api_status'] = "NOT_FOUND"
+                        generated_rows.append(base_row)
+                        return generated_rows
+
+                    elif response.status == 429:
+                        # Non-blocking sleep!
+                        await asyncio.sleep(2 * attempt)
+                        continue
+                    else:
+                        await asyncio.sleep(1)
+                        continue
+
+            except Exception:
+                await asyncio.sleep(1)
+                continue
+
+        base_row['api_status'] = "FAILED_AFTER_RETRIES"
+        generated_rows.append(base_row)
+        return generated_rows
 
 # -------------------------------
-# 3. EXECUTION LOOP
+# 3. MAIN MANAGER
 # -------------------------------
-print(f"Resuming with {MAX_WORKERS} workers...")
+async def main():
+    global write_header
 
-results_buffer = []
+    # Create the Traffic Light (Semaphore)
+    semaphore = asyncio.Semaphore(CONCURRENT_LIMIT)
 
-# We always append ('a') because we are resuming.
-# We NEVER write the header=True because the file already has headers.
-# Exception: If the file didn't exist (fresh start), we write headers.
-write_header = not os.path.exists(OUTPUT_CSV)
+    # Open one giant session for everyone
+    async with aiohttp.ClientSession(headers=HEADERS) as session:
 
-with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-    futures = executor.map(fetch_parcel_data, parcels_to_do)
+        tasks = []
+        # Create a task for every parcel
+        for row in parcels_to_do:
+            task = fetch_parcel(session, row, semaphore)
+            tasks.append(task)
 
-    for i, result in tqdm(enumerate(futures), total=len(parcels_to_do), desc="Processing"):
-        results_buffer.append(result)
+        # Process in batches to save memory and write to disk frequently
+        results_buffer = []
 
-        if len(results_buffer) >= SAVE_EVERY:
+        # tqdm wrapper for async tasks
+        for f in tqdm.as_completed(tasks, total=len(tasks), desc="Async Speed"):
+            result = await f
+            results_buffer.extend(result)
+
+            if len(results_buffer) >= SAVE_EVERY:
+                df_chunk = pd.DataFrame(results_buffer)
+                df_chunk = df_chunk.reindex(columns=FINAL_COLUMNS)
+
+                if write_header:
+                    df_chunk.to_csv(OUTPUT_CSV, index=False, mode='w', encoding='utf-8-sig')
+                    write_header = False
+                else:
+                    df_chunk.to_csv(OUTPUT_CSV, index=False, mode='a', header=False, encoding='utf-8-sig')
+
+                results_buffer = []
+
+        # Final Save
+        if results_buffer:
             df_chunk = pd.DataFrame(results_buffer)
-
-            # If we started from scratch (write_header=True), we write header on the first chunk ONLY
+            df_chunk = df_chunk.reindex(columns=FINAL_COLUMNS)
             if write_header:
                 df_chunk.to_csv(OUTPUT_CSV, index=False, mode='w', encoding='utf-8-sig')
-                write_header = False # Next chunks will append
             else:
-                # Appending to existing file: header=False
                 df_chunk.to_csv(OUTPUT_CSV, index=False, mode='a', header=False, encoding='utf-8-sig')
 
-            results_buffer = []
+# -------------------------------
+# 4. RUNNER
+# -------------------------------
+# Jupyter/Colab usually runs an event loop already, so we use await main() if inside async context
+# But for a standard script, we use asyncio.run()
 
-# Save final buffer
-if results_buffer:
-    df_chunk = pd.DataFrame(results_buffer)
-    if write_header:
-        df_chunk.to_csv(OUTPUT_CSV, index=False, mode='w', encoding='utf-8-sig')
+# Since you are likely in Colab/Jupyter, paste this block:
+if __name__ == "__main__":
+    try:
+        # Check if loop is already running (Colab environment)
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    if loop and loop.is_running():
+        print("Asyncio loop detected. Using await...")
+        await main()
     else:
-        df_chunk.to_csv(OUTPUT_CSV, index=False, mode='a', header=False, encoding='utf-8-sig')
+        print("Starting fresh loop...")
+        asyncio.run(main())
 
-print(f"\n✅ COMPLETE! All remaining data appended to: {OUTPUT_CSV}")
+print(f"\nCOMPLETE! Data saved to: {OUTPUT_CSV}")
