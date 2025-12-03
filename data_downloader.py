@@ -9,13 +9,13 @@ from tqdm.asyncio import tqdm
 # -------------------------------
 # CONFIGURATION
 # -------------------------------
-INPUT_CSV = "/content/drive/MyDrive/suhail/riyadh_parcels_centroids_corrected_15 (1).csv"
-OUTPUT_CSV = "/content/drive/MyDrive/suhail/riyadh_parcels_full_data_final2.csv"
+# NOTE: Update these paths for your local machine!
+# e.g., r"C:\Users\Suhail\Documents\riyadh_parcels.csv"
+INPUT_CSV = r"riyadh_parcels_centroids_corrected_15 (1).csv"
+OUTPUT_CSV = r"riyadh_parcels_full_data_final2.csv"
 API_URL = "https://api2.suhail.ai/parcel/buildingRules?parcelObjectId={}"
 
 # ASYNC SETTINGS
-# '40' in Async is much more powerful than '40' in Threads.
-# It keeps the pipe full 100% of the time.
 CONCURRENT_LIMIT = 40
 SAVE_EVERY = 1000
 MAX_RETRIES = 5
@@ -44,6 +44,7 @@ print("--- STARTING ULTRA-FAST ASYNC SCRAPER ---")
 
 if not os.path.exists(INPUT_CSV):
     print(f"Error: Input file '{INPUT_CSV}' not found.")
+    print("Please update the INPUT_CSV path in the Configuration section.")
     exit()
 
 df_input = pd.read_csv(INPUT_CSV, dtype={'parcel_objectid': str, 'parcel_id': str})
@@ -73,7 +74,6 @@ if len(parcels_to_do) == 0:
 # 2. ASYNC WORKER
 # -------------------------------
 async def fetch_parcel(session, row, semaphore):
-    # The semaphore limits how many functions run at once
     async with semaphore:
         pid = str(row.get('parcel_objectid', '')).strip()
         if pid.endswith('.0'):
@@ -86,12 +86,10 @@ async def fetch_parcel(session, row, semaphore):
         for attempt in range(1, MAX_RETRIES + 1):
             try:
                 async with session.get(url, timeout=20) as response:
-
                     if response.status == 200:
                         try:
                             json_data = await response.json()
                         except:
-                            # Handle cases where JSON is malformed
                             base_row['api_status'] = "JSON_ERROR"
                             generated_rows.append(base_row)
                             return generated_rows
@@ -127,7 +125,6 @@ async def fetch_parcel(session, row, semaphore):
                         return generated_rows
 
                     elif response.status == 429:
-                        # Non-blocking sleep!
                         await asyncio.sleep(2 * attempt)
                         continue
                     else:
@@ -147,23 +144,16 @@ async def fetch_parcel(session, row, semaphore):
 # -------------------------------
 async def main():
     global write_header
-
-    # Create the Traffic Light (Semaphore)
     semaphore = asyncio.Semaphore(CONCURRENT_LIMIT)
 
-    # Open one giant session for everyone
     async with aiohttp.ClientSession(headers=HEADERS) as session:
-
         tasks = []
-        # Create a task for every parcel
         for row in parcels_to_do:
             task = fetch_parcel(session, row, semaphore)
             tasks.append(task)
 
-        # Process in batches to save memory and write to disk frequently
         results_buffer = []
 
-        # tqdm wrapper for async tasks
         for f in tqdm.as_completed(tasks, total=len(tasks), desc="Async Speed"):
             result = await f
             results_buffer.extend(result)
@@ -180,7 +170,6 @@ async def main():
 
                 results_buffer = []
 
-        # Final Save
         if results_buffer:
             df_chunk = pd.DataFrame(results_buffer)
             df_chunk = df_chunk.reindex(columns=FINAL_COLUMNS)
@@ -190,24 +179,10 @@ async def main():
                 df_chunk.to_csv(OUTPUT_CSV, index=False, mode='a', header=False, encoding='utf-8-sig')
 
 # -------------------------------
-# 4. RUNNER
+# 4. RUNNER (VS CODE / TERMINAL)
 # -------------------------------
-# Jupyter/Colab usually runs an event loop already, so we use await main() if inside async context
-# But for a standard script, we use asyncio.run()
-
-# Since you are likely in Colab/Jupyter, paste this block:
 if __name__ == "__main__":
-    try:
-        # Check if loop is already running (Colab environment)
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        loop = None
-
-    if loop and loop.is_running():
-        print("Asyncio loop detected. Using await...")
-        await main()
-    else:
-        print("Starting fresh loop...")
-        asyncio.run(main())
-
-print(f"\nCOMPLETE! Data saved to: {OUTPUT_CSV}")
+    # In standard Python scripts (VS Code, PyCharm, Terminal),
+    # we use asyncio.run() to start the event loop.
+    asyncio.run(main())
+    print(f"\nCOMPLETE! Data saved to: {OUTPUT_CSV}")
