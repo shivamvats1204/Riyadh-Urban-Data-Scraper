@@ -2,9 +2,6 @@ requests
 mapbox-vector-tile
 shapely
 pandas
-concurrent.futures
 tqdm
-os
-time
-json
-pandas
+aiohttp
+asyncio
