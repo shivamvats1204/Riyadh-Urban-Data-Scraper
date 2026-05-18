@@ -1,183 +1,69 @@
-# **Riyadh Urban Data Scraper & Geospatial ETL 🇸🇦**
+# RiyadhGeoAI: Urban Intelligence Platform
 
-A full geospatial data engineering pipeline that reconstructs the entire urban parcel map of **Riyadh, Saudi Arabia** from raw vector tiles.
-This tool extracts, repairs, enriches, and exports **1.15M+ land parcels** with zoning rules, building codes, and setback regulations.
+RiyadhGeoAI is an end-to-end geospatial AI project for parcel-level urban planning analysis in Riyadh. It combines data scraping, regulatory feature engineering, unsupervised anomaly detection, explainable AI, interactive mapping, and retrieval-augmented zoning Q&A.
 
----
+## Why This Project Matters
 
-## 🚀 **Overview**
+Urban planning teams need to identify parcels with unusual zoning constraints, high development potential, or inconsistent regulation records. This project turns raw parcel and building-rule data into a professional decision-support workflow:
 
-This project solves a complex geospatial reverse-engineering problem by:
+- Clean and validate parcel regulation records.
+- Engineer a Development Potential Index from FAR, parcel coverage, and setbacks.
+- Train a PyTorch autoencoder to flag unusual zoning patterns.
+- Explain anomaly drivers with SHAP.
+- Explore parcels in a Streamlit dashboard with maps, filters, metrics, and zoning Q&A.
 
-* Extracting raw **Mapbox Vector Tile (MVT)** data
-* Correcting projection errors (fixing the *“Null Island / Pacific Ocean displacement”*)
-* Enriching parcel centroids with API-based zoning regulations
-* Handling mixed-use parcels and dynamic attribute schemas
+## Pipeline
 
----
-
-## 🔑 **Key Capabilities**
-
-### **Vector Tile Processing**
-
-* Decodes binary Protocol Buffers (`.pbf`)
-* Repairs invalid geometries (self-intersections, null areas) using **Shapely**
-
-### **Coordinate Projection Engine**
-
-* Converts tile integers (0–4096 extent) to **WGS84 lat/lon**
-* Fixes Web Mercator Y-axis inversion
-* Produces accurate parcel centroids
-
-### **High-Throughput ETL**
-
-* Utilizes `concurrent.futures` for **~50 requests/sec** scraping
-* Includes retries, rate-limit handling, and automatic backoff
-
-### **Smart Resume System**
-
-* Checkpoints progress for both steps
-* Automatically resumes after a crash or runtime disconnect
-
-### **Mixed-Use Parcel Handling**
-
-* Detects parcels with multiple zoning rules
-* “Explodes” them into multiple rows while preserving relationships
-
-### **Dynamic Schema Detection**
-
-* Reads all attributes returned by the API
-* No hardcoded field definitions
-* Automatically adapts to future API changes
-
----
-
-## 📂 **Project Structure**
-
-```
-├── requirements.txt         # Dependencies (pandas, shapely, mapbox-vector-tile, etc.)
-├── tiles_downloader.py      # STEP 1: Extract parcels + centroids from MVT tiles
-└── data_downloader.py       # STEP 2: API scraper for building rules/zoning data
-```
-
----
-
-## 🛠️ **Installation**
-
-Clone the repository:
+1. Download parcel centroids:
 
 ```bash
-git clone https://github.com/shivamvats1204/riyadh-urban-scraper.git
-cd riyadh-urban-scraper
+python tile_downloader.py --output riyadh_parcels_centroids.csv
 ```
 
-Install dependencies:
+2. Enrich parcels with zoning/building rules:
 
 ```bash
-pip install -r requirements.txt
+python data_downloader.py --input riyadh_parcels_centroids.csv --output riyadh_parcels_full_data.csv
 ```
 
----
-
-## ⚙️ **Usage**
-
-### **Step 1: Extract Geospatial Centroids**
-
-Run:
+3. Clean data and engineer planning features:
 
 ```bash
-python tiles_downloader.py
+python phase1_data_pipeline.py --input riyadh_parcels_full_data.csv --output riyadh_parcels_engineered.csv
 ```
 
-**Input:**
-Direct request to Vector Tile Server
-
-**Process:**
-
-* Scans ~4000 tiles (Zoom Level 16)
-* Converts tile geometry → WGS84
-* Repairs polygons
-* Deduplicates overlapping parcels
-
-**Output:**
-`riyadh_parcels_centroids_corrected.csv`
-*(Parcel ID + Latitude + Longitude)*
-
----
-
-### **Step 2: Enrich with Building Regulations**
-
-Run:
+4. Generate visual audit artifacts:
 
 ```bash
-python data_downloader.py
+python phase1_5_viz.py --input riyadh_parcels_engineered.csv
 ```
 
-**Input:**
-`riyadh_parcels_centroids_corrected.csv`
+5. Train and score the anomaly model:
 
-**Process:**
-
-* High-concurrency API calls
-* Handles mixed-use data
-* Expands 1-to-many relationships
-* Automatically extracts all returned fields
-
-**Output:**
-`riyadh_parcels_full_data_final.csv`
-*(Full zoning + regulation dataset)*
-
-> **Note:** Update `INPUT_CSV` and `OUTPUT_CSV` paths in both scripts as needed.
-
----
-
-## 🧩 **Technical Deep Dive**
-
-### **1. Fixing the "Pacific Ocean" Projection Error**
-
-Raw MVT coordinates are integers relative to each tile. Naively plotting them places Riyadh thousands of kilometers away.
-
-This project implements custom logic similar to **mercantile**:
-
-```python
-# Simplified logic from tiles_downloader.py
-def tile_coords_to_lonlat(px, py, z, x, y, extent=4096):
-    # Correct Web Mercator Y-flip
-    fy = (extent - py) / extent  
-    ...
+```bash
+python phase2_pytorch_anomaly.py --input riyadh_parcels_engineered.csv --output riyadh_parcels_with_anomalies.csv
 ```
 
-This correctly transforms tile coordinates → WGS84.
+6. Explain anomaly scores with SHAP:
 
----
-
-### **2. Handling Mixed-Use Zoning**
-
-Some parcels return a list of rules:
-
-```json
-"data": [
-  { "id": "Rule A" },
-  { "id": "Rule B" }
-]
+```bash
+python phase3_explainable_ai.py --input riyadh_parcels_with_anomalies.csv
 ```
 
-The script:
+7. Launch the dashboard:
 
-* Detects lists
-* Iterates each rule
-* Creates a separate row per rule
-* Preserves parcel → rule relationships
+```bash
+streamlit run app.py
+```
 
-This ensures **no regulatory info is lost**.
+## Key Technical Fixes
 
----
+- Regulatory number parsing now handles ranges such as `60-75` without turning them into invalid values like `6075`.
+- Malformed `api_status` rows are flagged for data-quality review instead of silently polluting the model.
+- The PyTorch model now saves reusable artifacts: model weights, scaler, metadata, anomaly threshold, and feature list.
+- SHAP now explains the trained autoencoder's reconstruction-error score, not an untrained model.
+- The dashboard reads the scored anomaly dataset when available and computes live metrics instead of using hardcoded values.
 
-## ⚠️ **Disclaimer**
+## Repository Notes
 
-This project is for **educational and research purposes only**.
-All extracted data belongs to its respective owners.
-Please respect the **Terms of Service**, **robots.txt**, and legal restrictions of any API or website you access.
-The author is not responsible for misuse.
-
----
+Large generated CSVs, images, local environments, and model artifacts are ignored by Git. For a portfolio or resume, keep a small sample dataset or publish the full data/model artifacts separately.

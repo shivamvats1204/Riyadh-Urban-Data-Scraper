@@ -1,0 +1,17 @@
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# Generated data and model artifacts
+*.csv
+*.parquet
+artifacts/
+
+# Generated reports
+*.png
+urban_heatmap.html
+
+# Local secrets
+.env
+.streamlit/secrets.toml
