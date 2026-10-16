@@ -1,6 +1,8 @@
 import argparse
 import logging
 import re
+import json
+import unicodedata
 from pathlib import Path
 
 import numpy as np
@@ -53,8 +55,10 @@ def parse_regulatory_number(value, strategy: str = "max") -> float:
     if isinstance(value, (int, float, np.number)):
         return float(value)
 
-    text = str(value).strip()
+    text = unicodedata.normalize("NFKC", str(value)).strip().replace("٫", ".").replace("٬", "")
     if not text:
+        return np.nan
+    if re.match(r"^[−-]\s*\d", text) or "," in text:
         return np.nan
 
     numbers = [float(item) for item in NUMBER_RE.findall(text)]
@@ -76,7 +80,9 @@ def flag_malformed_statuses(df: pd.DataFrame) -> pd.DataFrame:
     malformed = status.notna() & ~status.isin(VALID_API_STATUSES)
     df["Original_Api_Status"] = df["api_status"]
     df.loc[malformed, "api_status"] = "MALFORMED_OR_SHIFTED"
-    df["Data_Quality_Flag"] = np.where(malformed, "REVIEW_SOURCE_ROW", "OK")
+    df["Data_Quality_Flag"] = np.where(
+        malformed, "REVIEW_SOURCE_ROW", np.where(status.eq("SUCCESS").fillna(False), "OK", "API_NO_DATA_OR_ERROR")
+    )
     logging.info("Flagged %s rows with malformed api_status values.", int(malformed.sum()))
     return df
 
@@ -85,19 +91,26 @@ def clean_and_prepare_data(input_csv: str) -> pd.DataFrame:
     logging.info("Loading data from %s...", input_csv)
     df = pd.read_csv(input_csv)
     df = flag_malformed_statuses(df)
+    imputed = pd.DataFrame(index=df.index)
+    parse_review = pd.Series(False, index=df.index)
 
     for col in NUMERIC_FEATURES:
         if col not in df.columns:
             logging.warning("Expected numeric column missing: %s", col)
             df[col] = np.nan
-            continue
 
+        df[f"{col}__raw"] = df[col]
+        parse_review |= df[col].map(lambda text: len(NUMBER_RE.findall(str(text))) > 1)
         df[col] = df[col].map(parse_regulatory_number)
         lower, upper = FEATURE_BOUNDS[col]
         invalid = (df[col] < lower) | (df[col] > upper)
         if invalid.any():
             logging.info("Nulling %s out-of-bound values in %s.", int(invalid.sum()), col)
             df.loc[invalid, col] = np.nan
+        if "api_status" in df:
+            df.loc[df["api_status"] != "SUCCESS", col] = np.nan
+        imputed[col] = df[col].isna()
+        df[f"{col}__imputed"] = imputed[col]
 
     if "zoningGroup" in df.columns:
         for col in NUMERIC_FEATURES:
@@ -107,6 +120,12 @@ def clean_and_prepare_data(input_csv: str) -> pd.DataFrame:
 
     for col in NUMERIC_FEATURES:
         df[col] = df[col].fillna(df[col].median()).fillna(0)
+
+    df["Regulatory_Parse_Review"] = parse_review
+    df["Imputed_Fields"] = imputed.apply(lambda row: json.dumps(row.index[row].tolist()), axis=1)
+    df["Model_Training_Eligible"] = df["Data_Quality_Flag"].eq("OK") & ~imputed.any(axis=1) & ~parse_review
+    df.loc[df["Data_Quality_Flag"].eq("OK") & imputed.any(axis=1), "Data_Quality_Flag"] = "IMPUTED_REVIEW"
+    df.loc[df["Data_Quality_Flag"].eq("OK") & parse_review, "Data_Quality_Flag"] = "REGULATORY_PARSE_REVIEW"
 
     logging.info("Data cleaning and regulatory feature extraction complete.")
     return df

@@ -1,0 +1,9 @@
+parcel_id,zoningGroup,landuse,lat,lon,description,maxBuildingCoefficient,maxParcelCoverage,mainStreetsSetback,secondaryStreetsSetback,sideRearSetback,Normalized_DPI,Anomaly_Score_MSE,Data_Quality_Flag
+DEMO-001,Residential A,Residential,24.71,46.67,Synthetic residential record with garden frontage,2,60,6,3,2,42,0.01,SYNTHETIC
+DEMO-002,Residential A,Residential,24.72,46.68,Synthetic residential record with corner access,2.5,65,6,3,2,57,0.02,SYNTHETIC
+DEMO-003,Mixed B,Mixed use,24.73,46.69,Synthetic mixed use record near a commercial corridor,4,70,8,4,3,81,0.03,SYNTHETIC
+DEMO-004,Mixed B,Mixed use,24.74,46.70,Synthetic mixed use record with a large setback,3.5,60,12,6,4,64,0.09,SYNTHETIC
+DEMO-005,Commercial C,Commercial,24.75,46.71,Synthetic commercial record with high intensity,5,75,10,5,3,95,0.07,SYNTHETIC
+DEMO-006,Commercial C,Commercial,24.76,46.72,Synthetic commercial record with missing FAR,,70,8,4,3,,0.04,SYNTHETIC
+DEMO-007,Residential A,Residential,24.77,46.73,Synthetic residential record with unusual coverage,2,95,6,3,2,70,0.25,SYNTHETIC
+DEMO-008,Open D,Open space,24.78,46.74,Synthetic open space record,0.2,10,15,10,8,2,0.15,SYNTHETIC
