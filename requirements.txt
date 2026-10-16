@@ -1,3 +1,4 @@
+-r requirements-app.txt
 aiohttp
 faiss-cpu
 joblib

@@ -77,15 +77,29 @@ def train_anomaly_detector(
     seed: int = 42,
 ) -> None:
     set_seed(seed)
+    if not 50 <= anomaly_percentile < 100:
+        raise ValueError("Anomaly percentile must be at least 50 and below 100")
+    if epochs < 1 or batch_size < 1:
+        raise ValueError("Epochs and batch size must be positive")
     artifact_dir.mkdir(parents=True, exist_ok=True)
 
     logging.info("Loading engineered dataset from %s...", file_path)
     df = pd.read_csv(file_path)
     feature_frame = validate_features(df)
 
+    eligible = pd.Series(True, index=df.index)
+    if "Model_Training_Eligible" in df:
+        eligible &= df["Model_Training_Eligible"].astype(str).str.lower().eq("true")
+    elif "Data_Quality_Flag" in df:
+        eligible &= df["Data_Quality_Flag"].eq("OK")
+    eligible &= df[FEATURES].notna().all(axis=1)
+    if int(eligible.sum()) < 20:
+        raise ValueError("At least 20 complete, source-reviewed records are required for training")
+    raw_train, raw_val = train_test_split(feature_frame.loc[eligible], test_size=0.15, random_state=seed)
     scaler = StandardScaler()
-    scaled_data = scaler.fit_transform(feature_frame).astype(np.float32)
-    train_data, val_data = train_test_split(scaled_data, test_size=0.15, random_state=seed)
+    train_data = scaler.fit_transform(raw_train).astype(np.float32)
+    val_data = scaler.transform(raw_val).astype(np.float32)
+    scaled_data = scaler.transform(feature_frame).astype(np.float32)
 
     train_loader = DataLoader(
         TensorDataset(torch.from_numpy(train_data)),
@@ -144,9 +158,13 @@ def train_anomaly_detector(
         reconstructed = model(all_tensor)
         mse_per_row = torch.mean((all_tensor - reconstructed) ** 2, dim=1).numpy()
 
-    threshold = float(np.percentile(mse_per_row, anomaly_percentile))
+    with torch.no_grad():
+        val_reconstructed = model(val_tensor)
+        val_scores = torch.mean((val_tensor - val_reconstructed) ** 2, dim=1).numpy()
+    threshold = float(np.percentile(val_scores, anomaly_percentile))
     df["Anomaly_Score_MSE"] = mse_per_row
     df["Is_Anomaly"] = df["Anomaly_Score_MSE"] >= threshold
+    df["Anomaly_Review_Only"] = ~eligible
 
     df.to_csv(output_file, index=False, encoding="utf-8")
 
@@ -165,6 +183,10 @@ def train_anomaly_detector(
         "threshold": threshold,
         "anomalies": int(df["Is_Anomaly"].sum()),
         "best_validation_loss": best_loss,
+        "training_rows": int(len(train_data)),
+        "validation_rows": int(len(val_data)),
+        "threshold_source": "held_out_validation_reconstruction_errors",
+        "scaler_fit": "training_only",
         "seed": seed,
     }
     (artifact_dir / METADATA_PATH.name).write_text(json.dumps(metadata, indent=2), encoding="utf-8")
